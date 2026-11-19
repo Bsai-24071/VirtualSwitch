@@ -1,1 +1,10 @@
 *.o
+/obj/
+/obj_tsan/
+/obj_asan/
+/switch
+/host
+/switch_tsan
+/host_tsan
+/switch_asan
+/host_asan
