@@ -81,6 +81,11 @@ void mac_table_set_limits(mac_table_t *t, int max_entries, int max_age_sec,
 
 int mac_table_lookup(mac_table_t *t, const uint8_t mac[MAC_LEN])
 {
+    return mac_table_lookup_vlan(t, mac, -1);
+}
+
+int mac_table_lookup_vlan(mac_table_t *t, const uint8_t mac[MAC_LEN], int vlan)
+{
     if (t == NULL || mac == NULL) {
         return -1;
     }
@@ -90,23 +95,25 @@ int mac_table_lookup(mac_table_t *t, const uint8_t mac[MAC_LEN])
 
     int rc = pthread_mutex_lock(&b->lock);
     if (rc != 0) {
-        fprintf(stderr, "mac_table_lookup: lock: %s\n", strerror(rc));
+        fprintf(stderr, "mac_table_lookup_vlan: lock: %s\n", strerror(rc));
         return -1;
     }
 
     struct timespec now;
     if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
-        perror("mac_table_lookup: clock_gettime");
+        perror("mac_table_lookup_vlan: clock_gettime");
     }
 
     for (mac_entry_t *e = b->head; e != NULL; e = e->next) {
         if (memcmp(e->mac, mac, MAC_LEN) == 0) {
+            if (vlan >= 0 && e->vlan != vlan) break;
             port = e->port;
             e->last_used = now;
             break;
         }
     }
-    pthread_mutex_unlock(&b->lock);
+    int rc2 = pthread_mutex_unlock(&b->lock);
+    if (rc2 != 0) fprintf(stderr, "mac_table_lookup_vlan: unlock: %s\n", strerror(rc2));
     return port;
 }
 
@@ -134,7 +141,8 @@ static void lru_evict(mac_table_t *t)
                 found = 1;
             }
         }
-        pthread_mutex_unlock(&t->bucket[i].lock);
+        int rc2 = pthread_mutex_unlock(&t->bucket[i].lock);
+        if (rc2 != 0) fprintf(stderr, "lru_evict: unlock: %s\n", strerror(rc2));
     }
 
     if (!found || oldest_bucket < 0) return;
@@ -158,14 +166,19 @@ static void lru_evict(mac_table_t *t)
         }
         pp = &(*pp)->next;
     }
-    pthread_mutex_unlock(&t->bucket[oldest_bucket].lock);
+    int rc2 = pthread_mutex_unlock(&t->bucket[oldest_bucket].lock);
+    if (rc2 != 0) fprintf(stderr, "lru_evict: unlock b: %s\n", strerror(rc2));
 }
 
-int mac_table_insert(mac_table_t *t, const uint8_t mac[MAC_LEN], int port)
+int mac_table_insert(mac_table_t *t, const uint8_t mac[MAC_LEN], int port, int vlan,
+                     uint8_t old_mac_out[MAC_LEN], int *old_port_out)
 {
     if (t == NULL || mac == NULL || port < 0) {
         return MAC_TABLE_ERR;
     }
+
+    if (old_port_out) *old_port_out = -1;
+    if (old_mac_out) memset(old_mac_out, 0, MAC_LEN);
 
     struct timespec ts;
     if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
@@ -197,8 +210,21 @@ int mac_table_insert(mac_table_t *t, const uint8_t mac[MAC_LEN], int port)
 
     if (e != NULL) {
         if (e->port != port) {
+            int mpp = atomic_load_explicit(&t->max_per_port, memory_order_relaxed);
+            int pc  = (port >= 0 && port < MAC_TABLE_MAX_PORTS)
+                      ? atomic_load_explicit(&t->port_count[port], memory_order_relaxed)
+                      : 0;
+            if (mpp > 0 && pc >= mpp) {
+                int rc2 = pthread_mutex_unlock(&b->lock);
+                if (rc2 != 0) fprintf(stderr, "mac_table_insert: unlock: %s\n", strerror(rc2));
+                free(fresh);
+                return MAC_TABLE_PORT_LIMIT;
+            }
             old_port  = e->port;
+            if (old_mac_out) memcpy(old_mac_out, e->mac, MAC_LEN);
+            if (old_port_out) *old_port_out = old_port;
             e->port   = port;
+            e->vlan   = vlan;
             result    = MAC_TABLE_MOVED;
             if (old_port >= 0 && old_port < MAC_TABLE_MAX_PORTS) {
                 atomic_fetch_sub_explicit(&t->port_count[old_port], 1,
@@ -213,7 +239,8 @@ int mac_table_insert(mac_table_t *t, const uint8_t mac[MAC_LEN], int port)
         }
         e->last_seen = ts;
         e->last_used = ts;
-        pthread_mutex_unlock(&b->lock);
+        int rc2 = pthread_mutex_unlock(&b->lock);
+        if (rc2 != 0) fprintf(stderr, "mac_table_insert: unlock: %s\n", strerror(rc2));
         free(fresh);
     } else {
         int mpp = atomic_load_explicit(&t->max_per_port, memory_order_relaxed);
@@ -221,13 +248,15 @@ int mac_table_insert(mac_table_t *t, const uint8_t mac[MAC_LEN], int port)
                   ? atomic_load_explicit(&t->port_count[port], memory_order_relaxed)
                   : 0;
         if (mpp > 0 && pc >= mpp) {
-            pthread_mutex_unlock(&b->lock);
+            int rc2 = pthread_mutex_unlock(&b->lock);
+            if (rc2 != 0) fprintf(stderr, "mac_table_insert: unlock: %s\n", strerror(rc2));
             free(fresh);
             return MAC_TABLE_PORT_LIMIT;
         }
 
         memcpy(fresh->mac, mac, MAC_LEN);
         fresh->port      = port;
+        fresh->vlan      = vlan;
         fresh->last_seen = ts;
         fresh->last_used = ts;
         fresh->next      = b->head;
@@ -239,11 +268,8 @@ int mac_table_insert(mac_table_t *t, const uint8_t mac[MAC_LEN], int port)
         }
         atomic_fetch_add_explicit(&t->total_count, 1, memory_order_relaxed);
 
-        pthread_mutex_unlock(&b->lock);
-    }
-
-    if (result == MAC_TABLE_MOVED) {
-        fprintf(stderr, "MAC moved: port %d -> port %d\n", old_port, port);
+        int rc2 = pthread_mutex_unlock(&b->lock);
+        if (rc2 != 0) fprintf(stderr, "mac_table_insert: unlock: %s\n", strerror(rc2));
     }
 
     if (result == MAC_TABLE_INSERTED) {
@@ -292,7 +318,8 @@ void mac_table_age(mac_table_t *t, int max_age_sec)
                 pp = &(*pp)->next;
             }
         }
-        pthread_mutex_unlock(&t->bucket[i].lock);
+        int rc2 = pthread_mutex_unlock(&t->bucket[i].lock);
+        if (rc2 != 0) fprintf(stderr, "mac_table_age: unlock: %s\n", strerror(rc2));
     }
 }
 
@@ -321,6 +348,61 @@ void mac_table_remove_port(mac_table_t *t, int port)
                 pp = &(*pp)->next;
             }
         }
-        pthread_mutex_unlock(&t->bucket[i].lock);
+        int rc2 = pthread_mutex_unlock(&t->bucket[i].lock);
+        if (rc2 != 0) fprintf(stderr, "mac_table_remove_port: unlock: %s\n", strerror(rc2));
     }
+}
+
+void mac_table_clear(mac_table_t *t)
+{
+    if (t == NULL) return;
+
+    for (int i = 0; i < MAC_TABLE_BUCKETS; i++) {
+        int rc = pthread_mutex_lock(&t->bucket[i].lock);
+        if (rc != 0) {
+            fprintf(stderr, "mac_table_clear: lock: %s\n", strerror(rc));
+            continue;
+        }
+
+        mac_entry_t *e = t->bucket[i].head;
+        while (e != NULL) {
+            mac_entry_t *next = e->next;
+            int p = e->port;
+            if (p >= 0 && p < MAC_TABLE_MAX_PORTS) {
+                atomic_fetch_sub_explicit(&t->port_count[p], 1, memory_order_relaxed);
+            }
+            atomic_fetch_sub_explicit(&t->total_count, 1, memory_order_relaxed);
+            free(e);
+            e = next;
+        }
+        t->bucket[i].head = NULL;
+        int rc2 = pthread_mutex_unlock(&t->bucket[i].lock);
+        if (rc2 != 0) fprintf(stderr, "mac_table_clear: unlock: %s\n", strerror(rc2));
+    }
+}
+
+void mac_table_dump(mac_table_t *t, FILE *f)
+{
+    if (t == NULL || f == NULL) return;
+
+    fprintf(f, "%-18s %-6s %-6s\n", "MAC", "Port", "VLAN");
+    fprintf(f, "%-18s %-6s %-6s\n", "------------------", "------", "------");
+
+    for (int i = 0; i < MAC_TABLE_BUCKETS; i++) {
+        int rc = pthread_mutex_lock(&t->bucket[i].lock);
+        if (rc != 0) {
+            fprintf(stderr, "mac_table_dump: lock: %s\n", strerror(rc));
+            continue;
+        }
+
+        for (mac_entry_t *e = t->bucket[i].head; e != NULL; e = e->next) {
+            fprintf(f, "%02x:%02x:%02x:%02x:%02x:%02x %-6d %-6d\n",
+                    e->mac[0], e->mac[1], e->mac[2],
+                    e->mac[3], e->mac[4], e->mac[5],
+                    e->port, e->vlan);
+        }
+        int rc2 = pthread_mutex_unlock(&t->bucket[i].lock);
+        if (rc2 != 0) fprintf(stderr, "mac_table_dump: unlock: %s\n", strerror(rc2));
+    }
+    if (fflush(f) != 0) perror("mac_table_dump: fflush");
 }
