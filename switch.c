@@ -14,6 +14,8 @@
 #include <unistd.h>
 #include <netinet/in.h>
 
+void *admin_thread_fn(void *arg);
+
 static void *signal_thread_fn(void *arg)
 {
     switch_t *sw = (switch_t *)arg;
@@ -21,14 +23,113 @@ static void *signal_thread_fn(void *arg)
     sigemptyset(&set);
     sigaddset(&set, SIGINT);
     sigaddset(&set, SIGTERM);
-    int sig = 0;
-    int rc = sigwait(&set, &sig);
-    if (rc != 0)
-        fprintf(stderr, "signal_thread: sigwait: %s\n", strerror(rc));
-    atomic_store(&sw->stop, 1);
-    uint8_t byte = 1;
-    ssize_t w = write(sw->stop_pipe[1], &byte, 1);
-    (void)w;
+    sigaddset(&set, SIGHUP);
+    sigaddset(&set, SIGUSR1);
+
+    for (;;) {
+        int sig = 0;
+        int rc = sigwait(&set, &sig);
+        if (rc != 0) {
+            fprintf(stderr, "signal_thread: sigwait: %s\n", strerror(rc));
+            break;
+        }
+
+        if (sig == SIGINT || sig == SIGTERM) {
+            atomic_store(&sw->stop, 1);
+            uint8_t byte = 1;
+            ssize_t w = write(sw->stop_pipe[1], &byte, 1);
+            (void)w;
+            break;
+        }
+
+        if (sig == SIGHUP) {
+            switch_config_t base_cfg;
+            char config_file[256] = "";
+            int rcl = pthread_mutex_lock(&sw->cfg_lock);
+            if (rcl == 0) {
+                base_cfg = sw->cfg;
+                strncpy(config_file, sw->cfg.log_file, sizeof config_file - 1);
+                config_file[sizeof config_file - 1] = '\0';
+                mutex_unlock_chk(&sw->cfg_lock, "signal SIGHUP: cfg_lock");
+            } else {
+                config_init(&base_cfg);
+            }
+
+            if (strlen(config_file) > 0) {
+                int load_rc = config_load_file(&base_cfg, config_file);
+                if (load_rc != 0) {
+                    log_msg("SIGHUP: config reload failed, keeping old config");
+                    continue;
+                }
+            }
+
+            int rcf = pthread_mutex_lock(&sw->cfg_lock);
+            if (rcf == 0) {
+                int old_rate = sw->cfg.rate_fps;
+                sw->cfg.mac_age_sec    = base_cfg.mac_age_sec;
+                sw->cfg.mac_max_entries = base_cfg.mac_max_entries;
+                sw->cfg.mac_max_per_port = base_cfg.mac_max_per_port;
+                sw->cfg.rate_fps       = base_cfg.rate_fps;
+                sw->cfg.wrr[0]         = base_cfg.wrr[0];
+                sw->cfg.wrr[1]         = base_cfg.wrr[1];
+                sw->cfg.wrr[2]         = base_cfg.wrr[2];
+                sw->cfg.prio_age_ms    = base_cfg.prio_age_ms;
+                sw->cfg.trunk_port     = base_cfg.trunk_port;
+                for (int i = 0; i < 64; i++) sw->cfg.vlan[i] = base_cfg.vlan[i];
+                int new_rate = sw->cfg.rate_fps;
+                int new_wrr[3] = {sw->cfg.wrr[0], sw->cfg.wrr[1], sw->cfg.wrr[2]};
+                int new_prio_age = sw->cfg.prio_age_ms;
+                int new_trunk = sw->cfg.trunk_port;
+                mutex_unlock_chk(&sw->cfg_lock, "signal SIGHUP: apply cfg_lock");
+
+                mac_table_set_limits(&sw->mac_table, base_cfg.mac_max_entries,
+                                     base_cfg.mac_age_sec, base_cfg.mac_max_per_port);
+
+                for (int i = 0; i < sw->num_ports; i++) {
+                    int st = atomic_load_explicit(&sw->ports[i].state, memory_order_relaxed);
+                    if (st == PORT_ACTIVE) {
+                        if (new_rate != old_rate) {
+                            out_queue_set_rate(&sw->ports[i].queue, new_rate);
+                        }
+                        out_queue_set_wrr(&sw->ports[i].queue, new_wrr);
+                        out_queue_set_prio_age(&sw->ports[i].queue, new_prio_age);
+                    }
+                    if (i < 64) {
+                        atomic_store_explicit(&sw->ports[i].vlan, base_cfg.vlan[i],
+                                              memory_order_relaxed);
+                    }
+                    int is_trunk = (new_trunk >= 0 && i == new_trunk) ? 1 : 0;
+                    atomic_store_explicit(&sw->ports[i].trunk, is_trunk, memory_order_relaxed);
+                }
+
+                log_msg("SIGHUP: config reloaded");
+            }
+            continue;
+        }
+
+        if (sig == SIGUSR1) {
+            char dump_path[256] = "";
+            int rcd = pthread_mutex_lock(&sw->cfg_lock);
+            if (rcd == 0) {
+                strncpy(dump_path, sw->cfg.dump_file, sizeof dump_path - 1);
+                dump_path[sizeof dump_path - 1] = '\0';
+                int rc2 = pthread_mutex_unlock(&sw->cfg_lock);
+                if (rc2 != 0) fprintf(stderr, "signal: cfg unlock: %s\n", strerror(rc2));
+            }
+            if (strlen(dump_path) > 0) {
+                FILE *f = fopen(dump_path, "w");
+                if (f) {
+                    mac_table_dump(&sw->mac_table, f);
+                    if (fclose(f) != 0) perror("signal: dump fclose");
+                    log_msg("SIGUSR1: MAC table dumped to %s", dump_path);
+                } else {
+                    perror("signal: fopen dump_file");
+                }
+            }
+            continue;
+        }
+    }
+
     return NULL;
 }
 
@@ -57,14 +158,24 @@ static void *aging_thread_fn(void *arg)
     }
 
     while (!atomic_load(&sw->stop)) {
-        int age_sec = sw->cfg.mac_age_sec;
+        int age_sec;
+        int rcf = pthread_mutex_lock(&sw->cfg_lock);
+        if (rcf == 0) {
+            age_sec = sw->cfg.mac_age_sec;
+            mutex_unlock_chk(&sw->cfg_lock, "aging: cfg_lock");
+        } else {
+            age_sec = 300;
+        }
+
+        int wake_sec = age_sec / 2;
+        if (wake_sec < 1) wake_sec = 1;
 
         struct timespec deadline;
         if (clock_gettime(CLOCK_REALTIME, &deadline) != 0) {
             perror("aging: clock_gettime");
             break;
         }
-        deadline.tv_sec += age_sec;
+        deadline.tv_sec += wake_sec;
 
         int rc2 = pthread_cond_timedwait(&sw->aging_cond, &sw->aging_lock,
                                           &deadline);
@@ -75,9 +186,20 @@ static void *aging_thread_fn(void *arg)
 
         if (atomic_load(&sw->stop)) break;
 
-        pthread_mutex_unlock(&sw->aging_lock);
+        rc = pthread_mutex_unlock(&sw->aging_lock);
+        if (rc != 0) {
+            fprintf(stderr, "aging: unlock: %s\n", strerror(rc));
+            return NULL;
+        }
 
-        mac_table_age(&sw->mac_table, age_sec);
+        int cur_age = 300;
+        rcf = pthread_mutex_lock(&sw->cfg_lock);
+        if (rcf == 0) {
+            cur_age = sw->cfg.mac_age_sec;
+            mutex_unlock_chk(&sw->cfg_lock, "aging: cfg_lock cur_age");
+        }
+
+        mac_table_age(&sw->mac_table, cur_age);
 
         rc = pthread_mutex_lock(&sw->aging_lock);
         if (rc != 0) {
@@ -86,7 +208,8 @@ static void *aging_thread_fn(void *arg)
         }
     }
 
-    pthread_mutex_unlock(&sw->aging_lock);
+    rc = pthread_mutex_unlock(&sw->aging_lock);
+    if (rc != 0) fprintf(stderr, "aging: final unlock: %s\n", strerror(rc));
     return NULL;
 }
 
@@ -97,12 +220,20 @@ static void *admission_thread_fn(void *arg)
     int        fd = aa->fd;
     free(aa);
 
-    int accept_ms = sw->cfg.accept_wait_ms;
+    int accept_ms;
+    int rcf = pthread_mutex_lock(&sw->cfg_lock);
+    if (rcf == 0) {
+        accept_ms = sw->cfg.accept_wait_ms;
+        mutex_unlock_chk(&sw->cfg_lock, "admission: cfg_lock");
+    } else {
+        accept_ms = 3000;
+    }
 
     struct timespec deadline;
     if (clock_gettime(CLOCK_REALTIME, &deadline) != 0) {
         perror("admission: clock_gettime");
-        close(fd);
+        int rc2 = close(fd);
+        if (rc2 != 0) perror("admission: close fd");
         goto done;
     }
     deadline.tv_sec  += accept_ms / 1000;
@@ -120,7 +251,8 @@ static void *admission_thread_fn(void *arg)
         const char *msg = "SWITCH FULL\n";
         ssize_t w = write(fd, msg, strlen(msg));
         (void)w;
-        close(fd);
+        int rc2 = close(fd);
+        if (rc2 != 0) perror("admission: close fd");
         goto done;
     }
 
@@ -128,35 +260,51 @@ static void *admission_thread_fn(void *arg)
     int rc2 = pthread_mutex_lock(&sw->slot_lock);
     if (rc2 != 0) {
         fprintf(stderr, "admission: slot_lock: %s\n", strerror(rc2));
-        sem_post(&sw->free_ports);
-        close(fd);
+        int rc3 = sem_post(&sw->free_ports);
+        if (rc3 != 0) perror("admission: sem_post");
+        rc3 = close(fd);
+        if (rc3 != 0) perror("admission: close fd");
         goto done;
     }
 
     for (int i = 0; i < sw->num_ports; i++) {
         int rc3 = pthread_mutex_lock(&sw->ports[i].lock);
         if (rc3 != 0) continue;
-        if (sw->ports[i].state == PORT_FREE) {
+        int st = atomic_load_explicit(&sw->ports[i].state, memory_order_relaxed);
+        if (st == PORT_FREE) {
             idx = i;
-            sw->ports[i].state = PORT_STARTING;
-            pthread_mutex_unlock(&sw->ports[i].lock);
+            atomic_store_explicit(&sw->ports[i].state, PORT_STARTING, memory_order_relaxed);
+            int rc4 = pthread_mutex_unlock(&sw->ports[i].lock);
+            if (rc4 != 0) fprintf(stderr, "admission: port unlock: %s\n", strerror(rc4));
             break;
         }
-        pthread_mutex_unlock(&sw->ports[i].lock);
+        int rc4 = pthread_mutex_unlock(&sw->ports[i].lock);
+        if (rc4 != 0) fprintf(stderr, "admission: port unlock: %s\n", strerror(rc4));
     }
-    pthread_mutex_unlock(&sw->slot_lock);
+    rc2 = pthread_mutex_unlock(&sw->slot_lock);
+    if (rc2 != 0) fprintf(stderr, "admission: slot_lock unlock: %s\n", strerror(rc2));
 
     if (idx < 0) {
         fprintf(stderr, "admission: no free slot found (semaphore inconsistency)\n");
-        sem_post(&sw->free_ports);
-        close(fd);
+        int rc3 = sem_post(&sw->free_ports);
+        if (rc3 != 0) perror("admission: sem_post");
+        rc3 = close(fd);
+        if (rc3 != 0) perror("admission: close fd");
         goto done;
     }
 
     if (port_start(sw, idx, fd, fd) != 0) {
         fprintf(stderr, "admission: port_start failed for idx=%d\n", idx);
-        sem_post(&sw->free_ports);
-        close(fd);
+        int rc3 = pthread_mutex_lock(&sw->ports[idx].lock);
+        if (rc3 == 0) {
+            atomic_store_explicit(&sw->ports[idx].state, PORT_FREE, memory_order_relaxed);
+            int rc4 = pthread_mutex_unlock(&sw->ports[idx].lock);
+            if (rc4 != 0) fprintf(stderr, "admission: port unlock: %s\n", strerror(rc4));
+        }
+        int rc5 = sem_post(&sw->free_ports);
+        if (rc5 != 0) perror("admission: sem_post");
+        rc5 = close(fd);
+        if (rc5 != 0) perror("admission: close fd");
     }
 
 done:
@@ -167,7 +315,8 @@ done:
         if (rc3 != 0) {
             fprintf(stderr, "admission: adm_cond signal: %s\n", strerror(rc3));
         }
-        pthread_mutex_unlock(&sw->adm_mutex);
+        rc3 = pthread_mutex_unlock(&sw->adm_mutex);
+        if (rc3 != 0) fprintf(stderr, "admission: adm unlock: %s\n", strerror(rc3));
     }
     return NULL;
 }
@@ -207,10 +356,13 @@ static void *acceptor_thread_fn(void *arg)
             break;
         }
 
+        set_nonblocking(cfd);
+
         adm_arg_t *aa = malloc(sizeof *aa);
         if (aa == NULL) {
             perror("acceptor: malloc");
-            close(cfd);
+            int rc2 = close(cfd);
+            if (rc2 != 0) perror("acceptor: close cfd");
             continue;
         }
         aa->sw = sw;
@@ -220,28 +372,34 @@ static void *acceptor_thread_fn(void *arg)
         if (rc != 0) {
             fprintf(stderr, "acceptor: adm_mutex lock: %s\n", strerror(rc));
             free(aa);
-            close(cfd);
+            int rc2 = close(cfd);
+            if (rc2 != 0) perror("acceptor: close cfd");
             continue;
         }
         sw->adm_count++;
-        pthread_mutex_unlock(&sw->adm_mutex);
+        int rc2 = pthread_mutex_unlock(&sw->adm_mutex);
+        if (rc2 != 0) fprintf(stderr, "acceptor: adm unlock: %s\n", strerror(rc2));
 
         pthread_t tid;
-        int rc2 = pthread_create(&tid, NULL, admission_thread_fn, aa);
-        if (rc2 != 0) {
+        rc = pthread_create(&tid, NULL, admission_thread_fn, aa);
+        if (rc != 0) {
             fprintf(stderr, "acceptor: pthread_create admission: %s\n",
-                    strerror(rc2));
+                    strerror(rc));
             free(aa);
-            close(cfd);
+            rc2 = close(cfd);
+            if (rc2 != 0) perror("acceptor: close cfd");
             rc = pthread_mutex_lock(&sw->adm_mutex);
             if (rc == 0) {
                 sw->adm_count--;
-                pthread_cond_signal(&sw->adm_cond);
-                pthread_mutex_unlock(&sw->adm_mutex);
+                rc2 = pthread_cond_signal(&sw->adm_cond);
+                if (rc2 != 0) fprintf(stderr, "acceptor: adm_cond signal: %s\n", strerror(rc2));
+                rc2 = pthread_mutex_unlock(&sw->adm_mutex);
+                if (rc2 != 0) fprintf(stderr, "acceptor: adm unlock: %s\n", strerror(rc2));
             }
             continue;
         }
-        pthread_detach(tid);
+        rc = pthread_detach(tid);
+        if (rc != 0) fprintf(stderr, "acceptor: detach: %s\n", strerror(rc));
     }
 
     return NULL;
@@ -291,6 +449,8 @@ int main(int argc, char *argv[])
 
     config_init(&sw.cfg);
 
+    char config_file_path[256] = "";
+
     for (int i = 3; i < argc; i++) {
         char *eq = strchr(argv[i], '=');
         if (eq == NULL) {
@@ -298,12 +458,31 @@ int main(int argc, char *argv[])
             return 1;
         }
         *eq = '\0';
+        if (strcmp(argv[i], "config") == 0) {
+            strncpy(config_file_path, eq + 1, sizeof config_file_path - 1);
+            config_file_path[sizeof config_file_path - 1] = '\0';
+            *eq = '=';
+            continue;
+        }
         if (config_set(&sw.cfg, argv[i], eq + 1) != 0) {
             fprintf(stderr, "Unknown config key or bad value: %s\n", argv[i]);
             *eq = '=';
             return 1;
         }
         *eq = '=';
+    }
+
+    if (strlen(config_file_path) > 0) {
+        if (config_load_file(&sw.cfg, config_file_path) != 0) {
+            fprintf(stderr, "Failed to load config file: %s\n", config_file_path);
+            return 1;
+        }
+    }
+
+    log_start(sw.cfg.log_file);
+
+    if (shm_stats_create(sw.cfg.shm_name, num_ports) != 0) {
+        fprintf(stderr, "Warning: shared memory stats unavailable\n");
     }
 
     sw.listen_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -339,6 +518,13 @@ int main(int argc, char *argv[])
     set_nonblocking(sw.stop_pipe[0]);
     set_nonblocking(sw.stop_pipe[1]);
 
+    if (pipe(sw.admin_pipe) != 0) {
+        perror("pipe admin_pipe");
+        return 1;
+    }
+    set_nonblocking(sw.admin_pipe[0]);
+    set_nonblocking(sw.admin_pipe[1]);
+
     if (mac_table_init(&sw.mac_table) != 0) {
         fprintf(stderr, "mac_table_init failed\n");
         return 1;
@@ -367,6 +553,10 @@ int main(int argc, char *argv[])
     if (rc != 0) { fprintf(stderr, "adm_mutex init: %s\n", strerror(rc)); return 1; }
     rc = pthread_cond_init(&sw.adm_cond, NULL);
     if (rc != 0) { fprintf(stderr, "adm_cond init: %s\n", strerror(rc)); return 1; }
+    rc = pthread_mutex_init(&sw.refill_lock, NULL);
+    if (rc != 0) { fprintf(stderr, "refill_lock init: %s\n", strerror(rc)); return 1; }
+    rc = pthread_cond_init(&sw.refill_cond, NULL);
+    if (rc != 0) { fprintf(stderr, "refill_cond init: %s\n", strerror(rc)); return 1; }
 
     sw.reap_capacity = num_ports + 4;
     sw.reap_list     = malloc(sizeof(int) * (size_t)sw.reap_capacity);
@@ -385,6 +575,12 @@ int main(int argc, char *argv[])
             fprintf(stderr, "port_init failed for port %d\n", i);
             return 1;
         }
+        if (sw.cfg.trunk_port >= 0 && i == sw.cfg.trunk_port) {
+            atomic_store_explicit(&sw.ports[i].trunk, 1, memory_order_relaxed);
+        }
+        if (i < 64) {
+            atomic_store_explicit(&sw.ports[i].vlan, sw.cfg.vlan[i], memory_order_relaxed);
+        }
     }
 
     pthread_t sig_tid;
@@ -393,6 +589,12 @@ int main(int argc, char *argv[])
 
     rc = pthread_create(&sw.aging_thread, NULL, aging_thread_fn, &sw);
     if (rc != 0) { fprintf(stderr, "aging thread: %s\n", strerror(rc)); return 1; }
+
+    rc = pthread_create(&sw.refill_thread, NULL, refill_thread_fn, &sw);
+    if (rc != 0) { fprintf(stderr, "refill thread: %s\n", strerror(rc)); return 1; }
+
+    rc = pthread_create(&sw.admin_thread, NULL, admin_thread_fn, &sw);
+    if (rc != 0) { fprintf(stderr, "admin thread: %s\n", strerror(rc)); return 1; }
 
     pthread_t reap_tid;
     rc = pthread_create(&reap_tid, NULL, reaper_thread, &sw);
@@ -411,17 +613,16 @@ int main(int argc, char *argv[])
     rc = pthread_mutex_lock(&sw.adm_mutex);
     if (rc == 0) {
         while (sw.adm_count > 0) {
-            pthread_cond_wait(&sw.adm_cond, &sw.adm_mutex);
+            int rc2 = pthread_cond_wait(&sw.adm_cond, &sw.adm_mutex);
+            if (rc2 != 0) fprintf(stderr, "main: adm_cond wait: %s\n", strerror(rc2));
         }
-        pthread_mutex_unlock(&sw.adm_mutex);
+        int rc2 = pthread_mutex_unlock(&sw.adm_mutex);
+        if (rc2 != 0) fprintf(stderr, "main: adm unlock: %s\n", strerror(rc2));
     }
 
     for (int i = 0; i < num_ports; i++) {
-        int rc2 = pthread_mutex_lock(&sw.ports[i].lock);
-        if (rc2 != 0) continue;
-        int state = sw.ports[i].state;
-        pthread_mutex_unlock(&sw.ports[i].lock);
-        if (state == PORT_ACTIVE) {
+        int st = atomic_load_explicit(&sw.ports[i].state, memory_order_relaxed);
+        if (st == PORT_ACTIVE) {
             port_stop(&sw, i, PORT_CLOSING);
         }
     }
@@ -429,8 +630,10 @@ int main(int argc, char *argv[])
     rc = pthread_mutex_lock(&sw.reap_mutex);
     if (rc == 0) {
         sw.reap_done = 1;
-        pthread_cond_signal(&sw.reap_cond);
-        pthread_mutex_unlock(&sw.reap_mutex);
+        int rc2 = pthread_cond_signal(&sw.reap_cond);
+        if (rc2 != 0) fprintf(stderr, "main: reap_cond signal: %s\n", strerror(rc2));
+        rc2 = pthread_mutex_unlock(&sw.reap_mutex);
+        if (rc2 != 0) fprintf(stderr, "main: reap unlock: %s\n", strerror(rc2));
     }
 
     rc = pthread_join(reap_tid, NULL);
@@ -439,35 +642,82 @@ int main(int argc, char *argv[])
     rc = pthread_mutex_lock(&sw.aging_lock);
     if (rc == 0) {
         atomic_store(&sw.stop, 1);
-        pthread_cond_signal(&sw.aging_cond);
-        pthread_mutex_unlock(&sw.aging_lock);
+        int rc2 = pthread_cond_signal(&sw.aging_cond);
+        if (rc2 != 0) fprintf(stderr, "main: aging_cond signal: %s\n", strerror(rc2));
+        rc2 = pthread_mutex_unlock(&sw.aging_lock);
+        if (rc2 != 0) fprintf(stderr, "main: aging unlock: %s\n", strerror(rc2));
     }
     rc = pthread_join(sw.aging_thread, NULL);
     if (rc != 0) { fprintf(stderr, "join aging: %s\n", strerror(rc)); }
+
+    rc = pthread_mutex_lock(&sw.refill_lock);
+    if (rc == 0) {
+        atomic_store(&sw.stop, 1);
+        int rc2 = pthread_cond_signal(&sw.refill_cond);
+        if (rc2 != 0) fprintf(stderr, "main: refill_cond signal: %s\n", strerror(rc2));
+        rc2 = pthread_mutex_unlock(&sw.refill_lock);
+        if (rc2 != 0) fprintf(stderr, "main: refill unlock: %s\n", strerror(rc2));
+    }
+    rc = pthread_join(sw.refill_thread, NULL);
+    if (rc != 0) { fprintf(stderr, "join refill: %s\n", strerror(rc)); }
+
+    uint8_t stop_byte = 1;
+    ssize_t wb = write(sw.admin_pipe[1], &stop_byte, 1);
+    (void)wb;
+    rc = pthread_join(sw.admin_thread, NULL);
+    if (rc != 0) { fprintf(stderr, "join admin: %s\n", strerror(rc)); }
 
     mac_table_destroy(&sw.mac_table);
 
     for (int i = 0; i < num_ports; i++) {
         out_queue_destroy(&sw.ports[i].queue);
-        pthread_mutex_destroy(&sw.ports[i].lock);
+        int rc2 = pthread_mutex_destroy(&sw.ports[i].lock);
+        if (rc2 != 0) fprintf(stderr, "main: port lock destroy: %s\n", strerror(rc2));
     }
     free(sw.ports);
 
-    sem_destroy(&sw.free_ports);
+    int rc2 = sem_destroy(&sw.free_ports);
+    if (rc2 != 0) perror("main: sem_destroy");
     free(sw.reap_list);
 
-    pthread_mutex_destroy(&sw.slot_lock);
-    pthread_mutex_destroy(&sw.cfg_lock);
-    pthread_mutex_destroy(&sw.reap_mutex);
-    pthread_cond_destroy(&sw.reap_cond);
-    pthread_mutex_destroy(&sw.aging_lock);
-    pthread_cond_destroy(&sw.aging_cond);
-    pthread_mutex_destroy(&sw.adm_mutex);
-    pthread_cond_destroy(&sw.adm_cond);
+    rc2 = pthread_mutex_destroy(&sw.slot_lock);
+    if (rc2 != 0) fprintf(stderr, "main: slot_lock destroy: %s\n", strerror(rc2));
+    rc2 = pthread_mutex_destroy(&sw.cfg_lock);
+    if (rc2 != 0) fprintf(stderr, "main: cfg_lock destroy: %s\n", strerror(rc2));
+    rc2 = pthread_mutex_destroy(&sw.reap_mutex);
+    if (rc2 != 0) fprintf(stderr, "main: reap_mutex destroy: %s\n", strerror(rc2));
+    rc2 = pthread_cond_destroy(&sw.reap_cond);
+    if (rc2 != 0) fprintf(stderr, "main: reap_cond destroy: %s\n", strerror(rc2));
+    rc2 = pthread_mutex_destroy(&sw.aging_lock);
+    if (rc2 != 0) fprintf(stderr, "main: aging_lock destroy: %s\n", strerror(rc2));
+    rc2 = pthread_cond_destroy(&sw.aging_cond);
+    if (rc2 != 0) fprintf(stderr, "main: aging_cond destroy: %s\n", strerror(rc2));
+    rc2 = pthread_mutex_destroy(&sw.adm_mutex);
+    if (rc2 != 0) fprintf(stderr, "main: adm_mutex destroy: %s\n", strerror(rc2));
+    rc2 = pthread_cond_destroy(&sw.adm_cond);
+    if (rc2 != 0) fprintf(stderr, "main: adm_cond destroy: %s\n", strerror(rc2));
+    rc2 = pthread_mutex_destroy(&sw.refill_lock);
+    if (rc2 != 0) fprintf(stderr, "main: refill_lock destroy: %s\n", strerror(rc2));
+    rc2 = pthread_cond_destroy(&sw.refill_cond);
+    if (rc2 != 0) fprintf(stderr, "main: refill_cond destroy: %s\n", strerror(rc2));
 
-    close(sw.listen_fd);
-    close(sw.stop_pipe[0]);
-    close(sw.stop_pipe[1]);
+    char shm_name_copy[256];
+    strncpy(shm_name_copy, sw.cfg.shm_name, sizeof shm_name_copy - 1);
+    shm_name_copy[sizeof shm_name_copy - 1] = '\0';
+    shm_stats_destroy(shm_name_copy);
+
+    rc2 = close(sw.listen_fd);
+    if (rc2 != 0) perror("main: close listen_fd");
+    rc2 = close(sw.stop_pipe[0]);
+    if (rc2 != 0) perror("main: close stop_pipe[0]");
+    rc2 = close(sw.stop_pipe[1]);
+    if (rc2 != 0) perror("main: close stop_pipe[1]");
+    rc2 = close(sw.admin_pipe[0]);
+    if (rc2 != 0) perror("main: close admin_pipe[0]");
+    rc2 = close(sw.admin_pipe[1]);
+    if (rc2 != 0) perror("main: close admin_pipe[1]");
+
+    log_stop();
 
     return 0;
 }

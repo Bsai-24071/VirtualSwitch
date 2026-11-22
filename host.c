@@ -21,6 +21,8 @@ static int opt_die_mid_frame = 0;
 static int opt_no_read       = 0;
 static int opt_slow_read_ms  = 0;
 static int opt_coalesce      = 0;
+static int opt_sniffer       = 0;
+static int opt_flood_n       = 0;
 
 static int parse_mac(const char *str, uint8_t mac[MAC_LEN])
 {
@@ -156,9 +158,15 @@ static void *reader_thread_fn(void *arg)
         char src_str[18], dst_str[18];
         mac_to_str(hdr.src, src_str);
         mac_to_str(hdr.dst, dst_str);
-        printf("RX %s %s v=%u p=%u len=%u %s\n",
-               src_str, dst_str, hdr.vlan, hdr.priority, hdr.length,
-               payload ? (char *)payload : "");
+        if (opt_sniffer) {
+            printf("SNIFF %s %s v=%u p=%u len=%u %s\n",
+                   src_str, dst_str, hdr.vlan, hdr.priority, hdr.length,
+                   payload ? (char *)payload : "");
+        } else {
+            printf("RX %s %s v=%u p=%u len=%u %s\n",
+                   src_str, dst_str, hdr.vlan, hdr.priority, hdr.length,
+                   payload ? (char *)payload : "");
+        }
         fflush(stdout);
         free(payload);
     }
@@ -197,6 +205,10 @@ int main(int argc, char *argv[])
             opt_slow_read_ms = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--coalesce") == 0) {
             opt_coalesce = 1;
+        } else if (strcmp(argv[i], "--sniffer") == 0) {
+            opt_sniffer = 1;
+        } else if (strcmp(argv[i], "--flood") == 0 && i + 1 < argc) {
+            opt_flood_n = atoi(argv[++i]);
         } else {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
         }
@@ -231,6 +243,28 @@ int main(int argc, char *argv[])
     if (rc != 0) {
         fprintf(stderr, "pthread_create reader: %s\n", strerror(rc));
         return 1;
+    }
+
+    if (opt_flood_n > 0) {
+        uint8_t bcast[MAC_LEN];
+        memset(bcast, 0xFF, MAC_LEN);
+        frame_header_t fhdr;
+        memset(&fhdr, 0, sizeof fhdr);
+        memcpy(fhdr.src, my_mac, MAC_LEN);
+        memcpy(fhdr.dst, bcast, MAC_LEN);
+        fhdr.vlan = 1;
+        fhdr.priority = PRIO_NORMAL;
+        const char *ftext = "flood";
+        fhdr.length = (uint16_t)strlen(ftext);
+        for (int fi = 0; fi < opt_flood_n && !atomic_load(&g_stop); fi++) {
+            if (send_frame(g_sock, &fhdr, (const uint8_t *)ftext, strlen(ftext)) != 0) break;
+        }
+        atomic_store(&g_stop, 1);
+        shutdown(g_sock, SHUT_RDWR);
+        pthread_join(rtid, NULL);
+        rc = close(g_sock);
+        if (rc != 0) perror("host: close sock");
+        return 0;
     }
 
     char line[2048];
@@ -310,13 +344,15 @@ int main(int argc, char *argv[])
 
     if (!atomic_load(&g_stop)) {
         pthread_join(rtid, NULL);
-        close(g_sock);
+        int rc2 = close(g_sock);
+        if (rc2 != 0) perror("host: close sock");
         return 0;
     }
 
     atomic_store(&g_stop, 1);
     shutdown(g_sock, SHUT_RDWR);
     pthread_join(rtid, NULL);
-    close(g_sock);
+    int rc2 = close(g_sock);
+    if (rc2 != 0) perror("host: close sock");
     return 0;
 }

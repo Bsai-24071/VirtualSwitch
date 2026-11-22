@@ -1,72 +1,116 @@
-# Virtual Switch (Phase 1)
+# Virtual Switch (Phase 2)
 
-A multithreaded network switch implementation in C (POSIX threads, Linux).
+A multithreaded network switch implementation in C (POSIX threads, Linux C11).
 
-## Phase 1 Layout
+## Architecture & Layout
 
-The Phase 1 implementation keeps the Lab frame and MAC-table files intact and
-groups the smaller modules into a few files:
+- `common.h/.c`: Wire I/O helpers (`read_full`, `write_full`), ref-counted frame buffers, shared-memory statistics, configuration loader, utility helpers.
+- `logger.c`: Non-blocking ring-buffer logger thread writing formatted timestamps to `log_file`.
+- `queue.h/.c`: 3-priority output queue with Weighted Round-Robin (WRR), anti-starvation age promotion, and token-bucket rate limiting.
+- `mac_table.h/.c`: Striped hash table with per-bucket mutexes, LRU eviction, dynamic aging, per-port security limits, table dump, and clear.
+- `port.h/.c`: Port lifecycle management, non-blocking RX/TX threads, background reaper thread, token-refill timer thread, VLAN filtering, port mirroring, and forwarding logic.
+- `switch.h`: Port and switch control structures, port states, and lock order definitions.
+- `switch.c`: Main entry point, connection acceptor thread, bounded worker admission threads, MAC aging thread, signal handler thread, and orderedHow we mark it
+Public tests (released separately): a basic forwarding script and a broadcast script. Your switch must pass them.
+Hidden tests check that the switch survives real conditions: slow and misbehaving hosts, many hosts at once, and admin commands and signals while traffic flows.
+Our test hosts speak the fixed frame format, so most of the marking is automatic.
+What to hand in
+All source files and your Makefile.
+A README: how to build and run each program, and the config file format.
+A report of 2 to 3 pages with:
+a diagram of your threads and what each one does;
+every lock, and the data it protects;
+your lock order (item 10);
+one real bug you hit, and how you found and fixed it.
+Say which Tier 2 and Tier 3 items you completed.
+ shutdown.
+- `admin.c`: UNIX domain socket administrative server supporting runtime management and introspection.
+- `swctl.c`: CLI administrative utility for querying statistics and managing live switch configuration.
+- `host.c`: Test host utility with configurable traffic generation, trickle, fragmentation, flood, and sniffer modes.
 
-- `common.h/.c`: I/O helpers, frame buffers, atomic stats, and configuration
-- `queue.h/.c`: bounded output queue
-- `switch.h`: shared switch and port structures
-- `port.h/.c`: port lifecycle, receiver/sender threads, reaper, and forwarding
-- `switch.c`: main, admission, acceptor, signal, and aging threads
-
-## Building
+## Building & Testing
 
 ```bash
-make        # Builds switch and host with standard flags (-std=c11 -Wall -Wextra -Werror -g -O0)
-make clean  # Removes all binaries and object files
-make tsan   # Builds ThreadSanitizer binaries (switch_tsan, host_tsan)
-make asan   # Builds AddressSanitizer binaries (switch_asan, host_asan)
+make        # Builds switch, host, and swctl (-std=c11 -Wall -Wextra -Werror -g -O0)
+make clean  # Removes all binaries and build directories
+make test   # Executes full automated test suite (tests/t1..t11)
+make tsan   # Builds ThreadSanitizer binaries (switch_tsan, host_tsan, swctl_tsan)
+make asan   # Builds AddressSanitizer/UBSan binaries (switch_asan, host_asan, swctl_asan)
 ```
 
 ## Running
 
 ### Switch
 ```bash
-./switch <tcp_port> <num_ports> [key=value ...]
+./switch <tcp_port> <num_ports> [key=value ...] [config=<path>]
 ```
 Example:
 ```bash
-./switch 9000 4 mac_age_sec=300 queue_capacity=64
+./switch 9000 4 mac_age_sec=300 rate_fps=10 wrr=5:3:1
 ```
 
-### Host
+### Administrative Control (`swctl`)
+```bash
+./swctl [--sock <path>] [--shm <name>] <command> [args]
+```
+Supported commands:
+- `show mac`: Dump learned MAC addresses, associated ports, and VLANs.
+- `show ports`: Display current state, VLAN, mirror target, and trunk status for each port.
+- `shutdown <port>`: Administratively disable a port (`PORT_ADMIN_DOWN`).
+- `up <port>`: Re-enable an administratively or security-disabled port (`PORT_FREE`).
+- `vlan <port> <vlan>`: Set access VLAN (1-4094) for a port and flush its learned MAC entries.
+- `mirror <port> <sniffer_port>`: Mirror ingress and egress traffic of a port to a sniffer port (-1 to disable).
+- `clear mac`: Flush all dynamic entries in the switch MAC address table.
+- `stats`: Print per-port ingress, egress, drop, and mirror packet counters from shared memory.
+- `stats --watch`: Continuously display and update live statistics every second.
+
+### Host Tool
 ```bash
 ./host <switch_ip> <tcp_port> <mac> [options]
 ```
-Example:
-```bash
-./host 127.0.0.1 9000 aa:bb:cc:dd:ee:01
-```
-
 Host commands (via stdin):
-- `send <dst_mac> <prio> <vlan> <text>`: Send unicast frame
-- `bcast <prio> <vlan> <text>`: Send broadcast frame
-- `spoof <src_mac> <dst_mac> <prio> <vlan> <text>`: Send frame with specified source MAC
-- `quit`: Disconnect and exit
+- `send <dst_mac> <prio> <vlan> <text>`: Send unicast frame (priority: 0=High, 1=Normal, 2=Low).
+- `bcast <prio> <vlan> <text>`: Send broadcast frame (`ff:ff:ff:ff:ff:ff`).
+- `spoof <src_mac> <dst_mac> <prio> <vlan> <text>`: Send frame with custom source MAC.
+- `quit`: Cleanly disconnect and terminate.
 
-Host options:
-- `--trickle`: Transmit frame 1 byte at a time
-- `--die-mid-frame`: Transmit half a frame then terminate
-- `--no-read`: Stay connected without reading from socket
-- `--slow-read <ms>`: Delay reading frames
-- `--coalesce`: Send 2 frames together in one write
+Host command-line options:
+- `--sniffer`: Promiscuous receive mode displaying captured frames prefixed with `SNIFF`.
+- `--flood <n>`: Transmit `n` frames back-to-back as fast as possible.
+- `--trickle`: Transmit frame 1 byte at a time.
+- `--die-mid-frame`: Transmit half a frame then terminate abruptly.
+- `--no-read`: Stay connected without draining socket receive buffer.
+- `--slow-read <ms>`: Delay reading frames by specified milliseconds.
+- `--coalesce`: Send 2 frames coalesced into a single `write()` call.
 
-## Configuration Keys
+## Configuration File Format
 
-Pass as `key=value` command-line arguments:
-- `queue_capacity` (default: 64): Max frames in per-port output queue
-- `accept_wait_ms` (default: 3000): Milliseconds an extra host waits for a free port before timeout
-- `mac_age_sec` (default: 300): MAC entry lifetime in seconds
-- `mac_max_entries` (default: 1024): Maximum total MAC entries in switch table (LRU eviction)
-- `mac_max_per_port` (default: 8): Port security limit (maximum distinct MACs allowed per port)
+Configuration files can be loaded via `config=<path>` on the command line or reloaded live via `SIGHUP`.
+- Format: `key=value`, one setting per line.
+- Comments: Lines starting with `#` or text after `#` are ignored.
+- Blank lines and whitespace around keys and values are ignored.
 
-## Design Notes & Assumptions
+Supported configuration keys:
+| Key | Default | Reloaded on SIGHUP | Description |
+|---|---|---|---|
+| `queue_capacity` | 64 | No | Maximum frames in per-port output queue (>= 1) |
+| `accept_wait_ms` | 3000 | No | Admission queue timeout for pending connections (ms) |
+| `mac_age_sec` | 300 | Yes | Dynamic MAC entry lifetime in seconds (>= 1) |
+| `mac_max_entries` | 1024 | Yes | Maximum total MAC entries in switch table |
+| `mac_max_per_port` | 8 | Yes | Port security limit (maximum MACs per port) |
+| `rate_fps` | 0 | Yes | Egress rate limit in frames per second (0 = unlimited) |
+| `wrr` | `5:3:1` | Yes | Weighted Round Robin weights for High:Normal:Low priorities |
+| `prio_age_ms` | 200 | Yes | Anti-starvation promotion threshold (ms) |
+| `vlan.<port>` | 1 | Yes | Access VLAN assignment for specified port index (1-4094) |
+| `trunk_port` | -1 | Yes | Designate port as 802.1Q VLAN trunk (-1 = none) |
+| `log_file` | `switch.log` | No | File path for asynchronous timestamped logging |
+| `dump_file` | `mac_dump.txt` | No | Target file path for SIGUSR1 MAC table dump |
+| `sock_path` | `/tmp/vswitch.sock` | No | UNIX domain socket path for admin server |
+| `shm_name` | `/vswitch_stats` | No | POSIX shared memory object name for statistics |
 
-1. **Access Port Leniency**: On access ports, the switch ignores the host's `vlan` field and clamps `priority > 2` to `PRIO_NORMAL` (1). Access ports do not reject frames via `frame_header_validate`.
-2. **"SWITCH FULL" Response**: When all switch ports are occupied, an incoming connection waits up to `accept_wait_ms` milliseconds via `sem_timedwait`. If no port becomes free before the deadline expires, the switch replies with the ASCII line `SWITCH FULL\n` and closes the socket.
-3. **Semaphore Invariant**: The counting semaphore `free_ports` strictly equals the number of ports in state `PORT_FREE`. Ports in `PORT_SECURITY_DOWN` or `PORT_ADMIN_DOWN` do not post to the semaphore.
-4. **Reference Counting**: Broadcast and flooded frames allocate a single `frame_buf_t` with reference counting (`frame_buf_retain` / `frame_buf_release`) across destinations with atomic memory ordering.
+## POSIX Signals
+
+The switch blocks signals in all worker threads and dedicates a dedicated signal thread to `sigwait()`:
+- `SIGINT` / `SIGTERM`: Initiates orderly graceful shutdown: stops acceptor, joins admissions, closes and reaps all ports, stops timer and admin servers, flushes logger, unlinks shared memory and UNIX socket, and releases all memory.
+- `SIGHUP`: Dynamically reloads and applies configuration file updates (rate limits, WRR weights, MAC limits, VLANs, trunk port).
+- `SIGUSR1`: Atomically dumps the entire MAC forwarding table to `dump_file`.

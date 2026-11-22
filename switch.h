@@ -19,7 +19,7 @@
 typedef struct switch_s switch_t;
 
 typedef struct {
-    int state;
+    atomic_int state;
     int index;
     int rfd;
     int wfd;
@@ -30,6 +30,9 @@ typedef struct {
     int rx_running;
     int tx_running;
     pthread_mutex_t lock;
+    atomic_int vlan;
+    atomic_int mirror_to;
+    atomic_int trunk;
 } port_t;
 
 struct switch_s {
@@ -55,6 +58,14 @@ struct switch_s {
     pthread_mutex_t adm_mutex;
     int adm_count;
     pthread_cond_t adm_cond;
+    pthread_mutex_t refill_lock;
+    pthread_cond_t refill_cond;
+    pthread_t refill_thread;
+    pthread_t admin_thread;
+    int admin_pipe[2];
 };
+
+void port_shutdown(switch_t *sw, int idx);
+void port_up(switch_t *sw, int idx);
 
 #endif
