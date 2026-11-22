@@ -1,6 +1,7 @@
-# Virtual Switch (Phase 2)
+# Virtual Switch
 
-A multithreaded network switch implementation in C (POSIX threads, Linux C11).
+A multithreaded software network switch implementation in C (POSIX threads, Linux C11).
+Implements Tier 1 (Core items 1 to 5) and Tier 2 (Advanced items 6 to 13).
 
 ## Architecture & Layout
 
@@ -10,20 +11,7 @@ A multithreaded network switch implementation in C (POSIX threads, Linux C11).
 - `mac_table.h/.c`: Striped hash table with per-bucket mutexes, LRU eviction, dynamic aging, per-port security limits, table dump, and clear.
 - `port.h/.c`: Port lifecycle management, non-blocking RX/TX threads, background reaper thread, token-refill timer thread, VLAN filtering, port mirroring, and forwarding logic.
 - `switch.h`: Port and switch control structures, port states, and lock order definitions.
-- `switch.c`: Main entry point, connection acceptor thread, bounded worker admission threads, MAC aging thread, signal handler thread, and orderedHow we mark it
-Public tests (released separately): a basic forwarding script and a broadcast script. Your switch must pass them.
-Hidden tests check that the switch survives real conditions: slow and misbehaving hosts, many hosts at once, and admin commands and signals while traffic flows.
-Our test hosts speak the fixed frame format, so most of the marking is automatic.
-What to hand in
-All source files and your Makefile.
-A README: how to build and run each program, and the config file format.
-A report of 2 to 3 pages with:
-a diagram of your threads and what each one does;
-every lock, and the data it protects;
-your lock order (item 10);
-one real bug you hit, and how you found and fixed it.
-Say which Tier 2 and Tier 3 items you completed.
- shutdown.
+- `switch.c`: Main entry point, connection acceptor thread, bounded worker admission threads, MAC aging thread, signal handler thread, and ordered shutdown.
 - `admin.c`: UNIX domain socket administrative server supporting runtime management and introspection.
 - `swctl.c`: CLI administrative utility for querying statistics and managing live switch configuration.
 - `host.c`: Test host utility with configurable traffic generation, trickle, fragmentation, flood, and sniffer modes.

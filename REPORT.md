@@ -71,7 +71,7 @@ This project is a multithreaded network switch written in C11 for Linux using PO
 
 To mathematically guarantee deadlock freedom across all threads, every thread strictly acquires multiple locks in the following global order:
 
-$$\text{L1: } \texttt{cfg\_lock} \longrightarrow \text{L2: } \texttt{slot\_lock} \longrightarrow \text{L3: } \texttt{port->lock} \longrightarrow \text{L4: bucket lock} \longrightarrow \text{L5: } \texttt{queue->lock} \longrightarrow \text{L6: stats} \longrightarrow \text{L7: logger}$$
+The lock hierarchy is ordered from the configuration lock, to port-slot allocation, port state, MAC-table buckets, output queues, shared statistics, and finally the logger. Operations that need several locks acquire them in this order. They never acquire a lock from a higher level before finishing work on a lower-level lock, because doing so could create a circular wait between threads.
 
 ### Rules Preventing Deadlocks:
 1. **Strict Hierarchy**: No thread may acquire a higher-level lock while holding a lower-level lock (e.g., a thread holding `queue->lock` (L5) never attempts to acquire `cfg_lock` (L1) or `slot_lock` (L2)).
@@ -117,4 +117,3 @@ $$\text{L1: } \texttt{cfg\_lock} \longrightarrow \text{L2: } \texttt{slot\_lock}
 1. **Switch Full Response**: When all ports are occupied and the admission wait timeout expires, the switch transmits the ASCII string `SWITCH FULL\n` before closing the connection.
 2. **Access Port VLAN Assignment**: If an incoming frame on an access port already contains a non-zero VLAN field, the switch overwrites it with the access port's configured VLAN, ensuring untrusted hosts cannot spoof VLAN tags.
 3. **No Busy Waiting**: All synchronization uses POSIX condition variables (`pthread_cond_wait`, `pthread_cond_timedwait`), semaphores (`sem_wait`, `sem_timedwait`), or non-blocking `poll()` loops. The `sleep()` call is only used in `host.c` (test simulator) and `swctl.c` (`--watch` display loop).
- 
